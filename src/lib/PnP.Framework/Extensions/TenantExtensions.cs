@@ -80,44 +80,22 @@ namespace Microsoft.SharePoint.Client
             using (var tenantContext = tenant.Context.Clone((tenant.Context as ClientContext).Web.GetTenantAdministrationUrl()))
             {
                 var siteList = tenantContext.Web.Lists.GetByTitle("DO_NOT_DELETE_SPLIST_TENANTADMIN_AGGREGATED_SITECOLLECTIONS");
-                siteList.EnsureProperty(l => l.Id);
-                var payload = new
+                var query = new CamlQuery()
                 {
-                    parameters = new
-                    {
-                        RenderOptions = 2,
-                        ViewXml = $"<View><Query><Where><And><Eq><FieldRef Name='HubSiteId' /><Value Type='Guid'>{hubsiteId}</Value></Eq><And><Neq><FieldRef Name='SiteId' /><Value Type='Guid'>{hubsiteId}</Value></Neq><IsNull><FieldRef Name='TimeDeleted'/></IsNull></And></And></Where></Query><ViewFields><FieldRef Name='SiteUrl'/></ViewFields><RowLimit Paged='TRUE'>100</RowLimit></View>"
-                    }
+                    ViewXml = $"<View><Query><Where><And><Eq><FieldRef Name='HubSiteId' /><Value Type='Guid'>{hubsiteId}</Value></Eq><And><Neq><FieldRef Name='SiteId' /><Value Type='Guid'>{hubsiteId}</Value></Neq><IsNull><FieldRef Name='TimeDeleted'/></IsNull></And></And></Where></Query><ViewFields><FieldRef Name='SiteUrl'/></ViewFields></View><RowLimit Paging='TRUE'>100</RowLimit>"
                 };
 
-                var payloadString = JsonSerializer.Serialize(payload);
-                var response = RESTUtilities.ExecutePostAsync(tenantContext.Web, $"/_api/web/lists(guid'{siteList.Id}')/RenderListDataAsStream", payloadString).GetAwaiter().GetResult();
-                var responseElement = JsonSerializer.Deserialize<JsonElement>(response);
-                if (responseElement.TryGetProperty("Row", out JsonElement rowProperty))
+                do
                 {
-                    foreach (var row in rowProperty.EnumerateArray())
+                    var items = siteList.GetItems(query);
+                    tenantContext.Load(items);
+                    tenantContext.ExecuteQueryRetry();
+                    foreach (var item in items)
                     {
-                        if (row.TryGetProperty("SiteUrl", out JsonElement siteUrlProperty))
-                        {
-                            urls.Add(siteUrlProperty.GetString());
-                        }
+                        urls.Add(item["SiteUrl"].ToString());
                     }
-                    while (responseElement.TryGetProperty("NextHref", out JsonElement nextHrefElement))
-                    {
-                        response = RESTUtilities.ExecutePostAsync(((ClientContext)tenant.Context).Web, $"/_api/web/lists(guid'{siteList.Id}')/RenderListDataAsStream{nextHrefElement.GetString()}", payloadString).GetAwaiter().GetResult();
-                        responseElement = JsonSerializer.Deserialize<JsonElement>(response);
-                        if (responseElement.TryGetProperty("Row", out rowProperty))
-                        {
-                            foreach (var row in rowProperty.EnumerateArray())
-                            {
-                                if (row.TryGetProperty("SiteUrl", out JsonElement siteUrlProperty))
-                                {
-                                    urls.Add(siteUrlProperty.GetString());
-                                }
-                            }
-                        }
-                    }
-                }
+                    query.ListItemCollectionPosition = items.ListItemCollectionPosition;
+                } while (query.ListItemCollectionPosition != null);
             }
             return urls;
         }
@@ -590,23 +568,28 @@ namespace Microsoft.SharePoint.Client
             if (siteUrl == null)
                 throw new ArgumentNullException(nameof(siteUrl));
 
-            foreach (UserEntity admin in adminLogins)
+            // Create a separate context to the web
+            using (var clientContext = tenant.Context.Clone(siteUrl))
             {
-                var siteUrlString = siteUrl.ToString();
-                tenant.SetSiteAdmin(siteUrlString, admin.LoginName, true);
-                tenant.Context.ExecuteQueryRetry();
-                if (addToOwnersGroup)
+                foreach (UserEntity admin in adminLogins)
                 {
-                    // Create a separate context to the web
-                    using (var clientContext = tenant.Context.Clone(siteUrl))
+                    var spAdmin = clientContext.Web.EnsureUser(admin.LoginName);
+                    clientContext.Load(spAdmin);
+                    clientContext.ExecuteQueryRetry();
+
+                    if (addToOwnersGroup)
                     {
-                        var spAdmin = clientContext.Web.EnsureUser(admin.LoginName);
                         clientContext.Web.AssociatedOwnerGroup.Users.AddUser(spAdmin);
                         clientContext.Web.AssociatedOwnerGroup.Update();
                         clientContext.ExecuteQueryRetry();
                     }
+                    var siteUrlString = siteUrl.ToString();
+                    tenant.SetSiteAdmin(siteUrlString, spAdmin.LoginName, true);
+                    tenant.Context.ExecuteQueryRetry();
+
                 }
             }
+                
         }
         #endregion
 
@@ -891,7 +874,7 @@ namespace Microsoft.SharePoint.Client
                 var customHeaders = new Dictionary<string, string>();
                 customHeaders.Add("ConsistencyLevel", "eventual");
 
-
+                
                 // Retrieve (using the Microsoft Graph) the current user's roles
                 string jsonResponse = HttpHelper.MakeGetRequestForString(
                     $"https://{graphEndPoint}/v1.0/me/memberOf?$count=true&$search=\"displayName: Company Administrator\" OR \"displayName: Global Administrator\"",
